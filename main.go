@@ -1550,9 +1550,9 @@ func formatHadithBlock(lang, title, hadith string) string {
 
 	var b strings.Builder
 	b.WriteString("╔══")
-	b.WriteString(strings.Repeat("═", 6))
+	b.WriteString(strings.Repeat("═", 2))
 	b.WriteString(title)
-	b.WriteString(strings.Repeat("═", 6))
+	b.WriteString(strings.Repeat("═", 2))
 	b.WriteString("══╗\n")
 	b.WriteString(quote)
 	if source != "" {
@@ -1562,7 +1562,7 @@ func formatHadithBlock(lang, title, hadith string) string {
 		b.WriteString(source)
 	}
 	b.WriteString("\n╚")
-	b.WriteString(strings.Repeat("═", 21))
+	b.WriteString(strings.Repeat("═", 10))
 	b.WriteString("╝")
 	return b.String()
 }
@@ -2357,7 +2357,30 @@ func closeFace(face font.Face) {
 	}
 }
 
+var tajikToRussianImageReplacer = strings.NewReplacer(
+	"Ҳ", "Х",
+	"ҳ", "х",
+	"Қ", "К",
+	"қ", "к",
+	"Ғ", "Г",
+	"ғ", "г",
+	"Ҷ", "Ч",
+	"ҷ", "ч",
+	"Ӣ", "И",
+	"ӣ", "и",
+	"Ӯ", "У",
+	"ӯ", "у",
+)
+
+func normalizeImageText(text string) string {
+	if text == "" {
+		return ""
+	}
+	return tajikToRussianImageReplacer.Replace(text)
+}
+
 func drawTextTop(img *image.RGBA, face font.Face, x, top int, text string, clr color.RGBA) {
+	text = normalizeImageText(text)
 	if face == nil || text == "" {
 		return
 	}
@@ -2372,6 +2395,7 @@ func drawTextTop(img *image.RGBA, face font.Face, x, top int, text string, clr c
 }
 
 func measureTextWidth(face font.Face, text string) int {
+	text = normalizeImageText(text)
 	if face == nil || text == "" {
 		return 0
 	}
