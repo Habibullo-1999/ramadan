@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -10,15 +12,18 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"io"
 	"log"
 	"math"
 	"math/rand"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -129,6 +134,7 @@ type StateStore struct {
 	mu          sync.Mutex
 	users       map[int64]*UserSettings
 	persistPath string
+	redis       *redisStore
 }
 
 type UserSettings struct {
@@ -136,6 +142,17 @@ type UserSettings struct {
 	Region         string
 	Notifications  bool
 	RegionSelected bool
+}
+
+type redisStore struct {
+	addr       string
+	useTLS     bool
+	serverName string
+	username   string
+	password   string
+	db         int
+	usersKey   string
+	timeout    time.Duration
 }
 
 // ReminderManager schedules 30-minute-before notifications for each chat.
@@ -245,6 +262,7 @@ var translations = map[string]map[string]string{
 		"btn_notify_on":           "🔔 Ёдоварӣ ON",
 		"btn_notify_off":          "🔕 Ёдоварӣ OFF",
 		"btn_help":                "ℹ️ Ёрӣ",
+		"restart_update_notice":   "🔄 Бот нав шуд.\nЛутфан /start-ро дубора пахш кунед, то меню ва танзимот нав шаванд.",
 	},
 	langRU: {
 		"choose_language":         "Выберите язык:\n\nТоҷикӣ / Русский / English / O'zbek",
@@ -305,6 +323,7 @@ var translations = map[string]map[string]string{
 		"btn_notify_on":           "🔔 Напоминания ON",
 		"btn_notify_off":          "🔕 Напоминания OFF",
 		"btn_help":                "ℹ️ Помощь",
+		"restart_update_notice":   "🔄 Бот обновлён.\nПожалуйста, нажмите /start заново, чтобы обновить меню и настройки.",
 	},
 	langEN: {
 		"choose_language":         "Choose language:\n\nТоҷикӣ / Русский / English / O'zbek",
@@ -365,6 +384,7 @@ var translations = map[string]map[string]string{
 		"btn_notify_on":           "🔔 Reminders ON",
 		"btn_notify_off":          "🔕 Reminders OFF",
 		"btn_help":                "ℹ️ Help",
+		"restart_update_notice":   "🔄 Bot has been updated.\nPlease press /start again to refresh menu and settings.",
 	},
 	langUZ: {
 		"choose_language":         "Tilni tanlang:\n\nТоҷикӣ / Русский / English / O'zbek",
@@ -425,6 +445,7 @@ var translations = map[string]map[string]string{
 		"btn_notify_on":           "🔔 Eslatma ON",
 		"btn_notify_off":          "🔕 Eslatma OFF",
 		"btn_help":                "ℹ️ Yordam",
+		"restart_update_notice":   "🔄 Bot yangilandi.\nMenyu va sozlamalarni yangilash uchun /start ni qayta bosing.",
 	},
 }
 
@@ -497,8 +518,9 @@ func main() {
 
 	statePath := strings.TrimSpace(os.Getenv("STATE_FILE"))
 	if statePath == "" {
-		statePath = "state.json"
+		statePath = defaultStatePath()
 	}
+	log.Printf("Using state file: %s", statePath)
 
 	state, err := newStateStore(statePath)
 	if err != nil {
@@ -513,6 +535,10 @@ func main() {
 		bot.scheduler.Start(chatID, region)
 	}
 	log.Printf("Restored %d notification subscriptions from %s", len(restored), statePath)
+	allChats := state.AllChatIDs()
+	if len(allChats) > 0 {
+		go bot.sendRestartUpdateNotice(allChats)
+	}
 
 	log.Printf("Ramadan bot is running. Ramadan start: %s", start.Format("2006-01-02"))
 	ctx := context.Background()
@@ -759,6 +785,24 @@ func (b *Bot) SendPhoto(chatID int64, photo []byte, caption string) error {
 		return fmt.Errorf("telegram sendPhoto error %d: %s", result.ErrorCode, result.Description)
 	}
 	return nil
+}
+
+func (b *Bot) sendRestartUpdateNotice(chatIDs []int64) {
+	if len(chatIDs) == 0 {
+		return
+	}
+	interval := 50 * time.Millisecond
+
+	for i, chatID := range chatIDs {
+		if i > 0 {
+			time.Sleep(interval)
+		}
+		lang := b.userLang(chatID)
+		if err := b.SendMessage(chatID, tr(lang, "restart_update_notice"), nil); err != nil {
+			log.Printf("restart notice send error for chat %d: %v", chatID, err)
+		}
+	}
+	log.Printf("Restart notice sent to %d chats", len(chatIDs))
 }
 
 func (b *Bot) answerCallback(id string) {
@@ -1146,14 +1190,359 @@ type persistedStateData struct {
 	Users map[string]UserSettings `json:"users"`
 }
 
+func newRedisStore(rawURL string) (*redisStore, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, fmt.Errorf("empty REDIS_URL")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "redis" && u.Scheme != "rediss" {
+		return nil, fmt.Errorf("unsupported redis scheme %q", u.Scheme)
+	}
+
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return nil, fmt.Errorf("redis host is empty")
+	}
+	port := strings.TrimSpace(u.Port())
+	if port == "" {
+		port = "6379"
+	}
+
+	db := 0
+	if dbText := strings.TrimSpace(strings.TrimPrefix(u.Path, "/")); dbText != "" {
+		parsed, err := strconv.Atoi(dbText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid redis db from path %q: %w", dbText, err)
+		}
+		db = parsed
+	}
+	if dbText := strings.TrimSpace(u.Query().Get("db")); dbText != "" {
+		parsed, err := strconv.Atoi(dbText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid redis db from query %q: %w", dbText, err)
+		}
+		db = parsed
+	}
+
+	password := ""
+	username := ""
+	if u.User != nil {
+		username = strings.TrimSpace(u.User.Username())
+		password, _ = u.User.Password()
+	}
+
+	keyPrefix := strings.TrimSpace(os.Getenv("REDIS_KEY_PREFIX"))
+	if keyPrefix == "" {
+		keyPrefix = "ramadan-bot"
+	}
+
+	return &redisStore{
+		addr:       net.JoinHostPort(host, port),
+		useTLS:     u.Scheme == "rediss",
+		serverName: host,
+		username:   username,
+		password:   password,
+		db:         db,
+		usersKey:   keyPrefix + ":users",
+		timeout:    7 * time.Second,
+	}, nil
+}
+
+func (r *redisStore) ping() error {
+	resp, err := r.do("PING")
+	if err != nil {
+		return err
+	}
+	pong, err := redisRespString(resp)
+	if err != nil {
+		return err
+	}
+	if strings.ToUpper(strings.TrimSpace(pong)) != "PONG" {
+		return fmt.Errorf("unexpected ping response: %v", pong)
+	}
+	return nil
+}
+
+func (r *redisStore) loadUsers() (map[int64]*UserSettings, error) {
+	resp, err := r.do("HGETALL", r.usersKey)
+	if err != nil {
+		return nil, err
+	}
+	items, err := redisRespArray(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	users := make(map[int64]*UserSettings)
+	for i := 0; i+1 < len(items); i += 2 {
+		chatIDRaw, err := redisRespString(items[i])
+		if err != nil {
+			return nil, err
+		}
+		payload, err := redisRespString(items[i+1])
+		if err != nil {
+			return nil, err
+		}
+		chatID, err := strconv.ParseInt(strings.TrimSpace(chatIDRaw), 10, 64)
+		if err != nil {
+			log.Printf("skip invalid chat id in redis state: %q", chatIDRaw)
+			continue
+		}
+		var settings UserSettings
+		if err := json.Unmarshal([]byte(payload), &settings); err != nil {
+			log.Printf("skip invalid redis payload for chat %d: %v", chatID, err)
+			continue
+		}
+		settings.Language = normalizeLang(settings.Language)
+		copySettings := settings
+		users[chatID] = &copySettings
+	}
+	return users, nil
+}
+
+func (r *redisStore) saveUser(chatID int64, settings *UserSettings) error {
+	if settings == nil {
+		return nil
+	}
+	raw, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	_, err = r.do("HSET", r.usersKey, strconv.FormatInt(chatID, 10), string(raw))
+	return err
+}
+
+func (r *redisStore) do(args ...string) (interface{}, error) {
+	conn, reader, err := r.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := r.sessionSetup(conn, reader); err != nil {
+		return nil, err
+	}
+	if err := redisWriteCommand(conn, args...); err != nil {
+		return nil, err
+	}
+	resp, err := redisReadResponse(reader)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (r *redisStore) dial() (net.Conn, *bufio.Reader, error) {
+	dialer := &net.Dialer{Timeout: r.timeout}
+	var (
+		conn net.Conn
+		err  error
+	)
+	if r.useTLS {
+		conn, err = tls.DialWithDialer(dialer, "tcp", r.addr, &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: r.serverName,
+		})
+	} else {
+		conn, err = dialer.Dial("tcp", r.addr)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := conn.SetDeadline(time.Now().Add(r.timeout)); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	return conn, bufio.NewReader(conn), nil
+}
+
+func (r *redisStore) sessionSetup(conn net.Conn, reader *bufio.Reader) error {
+	if r.password != "" || r.username != "" {
+		if r.username != "" {
+			if err := redisExecuteSimple(conn, reader, "AUTH", r.username, r.password); err != nil {
+				return err
+			}
+		} else {
+			if err := redisExecuteSimple(conn, reader, "AUTH", r.password); err != nil {
+				return err
+			}
+		}
+	}
+	if r.db > 0 {
+		if err := redisExecuteSimple(conn, reader, "SELECT", strconv.Itoa(r.db)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func redisExecuteSimple(conn net.Conn, reader *bufio.Reader, args ...string) error {
+	if err := redisWriteCommand(conn, args...); err != nil {
+		return err
+	}
+	_, err := redisReadResponse(reader)
+	return err
+}
+
+func redisWriteCommand(conn net.Conn, args ...string) error {
+	var b strings.Builder
+	b.WriteString("*")
+	b.WriteString(strconv.Itoa(len(args)))
+	b.WriteString("\r\n")
+	for _, arg := range args {
+		b.WriteString("$")
+		b.WriteString(strconv.Itoa(len(arg)))
+		b.WriteString("\r\n")
+		b.WriteString(arg)
+		b.WriteString("\r\n")
+	}
+	_, err := conn.Write([]byte(b.String()))
+	return err
+}
+
+func redisReadResponse(reader *bufio.Reader) (interface{}, error) {
+	prefix, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	switch prefix {
+	case '+':
+		return redisReadLine(reader)
+	case '-':
+		line, err := redisReadLine(reader)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("redis error: %s", line)
+	case ':':
+		line, err := redisReadLine(reader)
+		if err != nil {
+			return nil, err
+		}
+		num, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		return num, nil
+	case '$':
+		line, err := redisReadLine(reader)
+		if err != nil {
+			return nil, err
+		}
+		size, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, err
+		}
+		if size == -1 {
+			return nil, nil
+		}
+		data := make([]byte, size+2)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return nil, err
+		}
+		return string(data[:size]), nil
+	case '*':
+		line, err := redisReadLine(reader)
+		if err != nil {
+			return nil, err
+		}
+		count, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, err
+		}
+		if count == -1 {
+			return nil, nil
+		}
+		out := make([]interface{}, 0, count)
+		for i := 0; i < count; i++ {
+			item, err := redisReadResponse(reader)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, item)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported redis response prefix: %q", prefix)
+	}
+}
+
+func redisReadLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), nil
+}
+
+func redisRespArray(v interface{}) ([]interface{}, error) {
+	if v == nil {
+		return []interface{}{}, nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected redis response type %T", v)
+	}
+	return arr, nil
+}
+
+func redisRespString(v interface{}) (string, error) {
+	if v == nil {
+		return "", nil
+	}
+	switch typed := v.(type) {
+	case string:
+		return typed, nil
+	case int64:
+		return strconv.FormatInt(typed, 10), nil
+	default:
+		return "", fmt.Errorf("unexpected redis string type %T", v)
+	}
+}
+
 func newStateStore(path string) (*StateStore, error) {
 	store := &StateStore{
 		users:       make(map[int64]*UserSettings),
 		persistPath: strings.TrimSpace(path),
 	}
+
+	redisURL := strings.TrimSpace(os.Getenv("REDIS_URL"))
+	if redisURL != "" {
+		rs, err := newRedisStore(redisURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid REDIS_URL: %w", err)
+		}
+		if err := rs.ping(); err != nil {
+			return nil, fmt.Errorf("cannot connect to redis: %w", err)
+		}
+		store.redis = rs
+		if err := store.loadFromRedis(); err != nil {
+			return nil, err
+		}
+		if len(store.users) == 0 && strings.TrimSpace(store.persistPath) != "" {
+			if err := store.loadFromDisk(); err != nil {
+				log.Printf("state migration load from file failed: %v", err)
+			} else if len(store.users) > 0 {
+				if err := store.syncAllUsersToRedis(); err != nil {
+					log.Printf("state migration file->redis failed: %v", err)
+				} else {
+					log.Printf("Migrated %d users from file state to redis", len(store.users))
+				}
+			}
+		}
+		log.Printf("State backend: redis (%s db=%d key=%s)", rs.addr, rs.db, rs.usersKey)
+		return store, nil
+	}
+
 	if err := store.loadFromDisk(); err != nil {
 		return nil, err
 	}
+	log.Printf("State backend: file (%s)", store.persistPath)
 	return store, nil
 }
 
@@ -1178,10 +1567,18 @@ func (s *StateStore) SetRegion(chatID int64, region string) {
 	settings.Region = region
 	settings.Notifications = true
 	settings.RegionSelected = true
+	copySettings := *settings
 	snapshot := s.snapshotLocked()
 	path := s.persistPath
+	rs := s.redis
 	s.mu.Unlock()
 
+	if rs != nil {
+		if err := rs.saveUser(chatID, &copySettings); err != nil {
+			log.Printf("state persist error (SetRegion redis): %v", err)
+		}
+		return
+	}
 	if err := writeStateSnapshot(path, snapshot); err != nil {
 		log.Printf("state persist error (SetRegion): %v", err)
 	}
@@ -1195,10 +1592,18 @@ func (s *StateStore) SetLanguage(chatID int64, lang string) {
 		s.users[chatID] = settings
 	}
 	settings.Language = normalizeLang(lang)
+	copySettings := *settings
 	snapshot := s.snapshotLocked()
 	path := s.persistPath
+	rs := s.redis
 	s.mu.Unlock()
 
+	if rs != nil {
+		if err := rs.saveUser(chatID, &copySettings); err != nil {
+			log.Printf("state persist error (SetLanguage redis): %v", err)
+		}
+		return
+	}
 	if err := writeStateSnapshot(path, snapshot); err != nil {
 		log.Printf("state persist error (SetLanguage): %v", err)
 	}
@@ -1212,10 +1617,18 @@ func (s *StateStore) SetNotifications(chatID int64, enabled bool) {
 		s.users[chatID] = settings
 	}
 	settings.Notifications = enabled
+	copySettings := *settings
 	snapshot := s.snapshotLocked()
 	path := s.persistPath
+	rs := s.redis
 	s.mu.Unlock()
 
+	if rs != nil {
+		if err := rs.saveUser(chatID, &copySettings); err != nil {
+			log.Printf("state persist error (SetNotifications redis): %v", err)
+		}
+		return
+	}
 	if err := writeStateSnapshot(path, snapshot); err != nil {
 		log.Printf("state persist error (SetNotifications): %v", err)
 	}
@@ -1237,6 +1650,20 @@ func (s *StateStore) ActiveNotificationRegions() map[int64]string {
 		result[chatID] = region
 	}
 	return result
+}
+
+func (s *StateStore) AllChatIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]int64, 0, len(s.users))
+	for chatID := range s.users {
+		ids = append(ids, chatID)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return ids[i] < ids[j]
+	})
+	return ids
 }
 
 func (s *StateStore) loadFromDisk() error {
@@ -1271,6 +1698,50 @@ func (s *StateStore) loadFromDisk() error {
 		}
 		copySettings := settings
 		s.users[chatID] = &copySettings
+	}
+	return nil
+}
+
+func (s *StateStore) loadFromRedis() error {
+	if s.redis == nil {
+		return nil
+	}
+	users, err := s.redis.loadUsers()
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for chatID, settings := range users {
+		if settings == nil {
+			continue
+		}
+		copySettings := *settings
+		s.users[chatID] = &copySettings
+	}
+	return nil
+}
+
+func (s *StateStore) syncAllUsersToRedis() error {
+	if s.redis == nil {
+		return nil
+	}
+	s.mu.Lock()
+	local := make(map[int64]UserSettings, len(s.users))
+	for chatID, settings := range s.users {
+		if settings == nil {
+			continue
+		}
+		local[chatID] = *settings
+	}
+	s.mu.Unlock()
+
+	for chatID, settings := range local {
+		copySettings := settings
+		if err := s.redis.saveUser(chatID, &copySettings); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2563,6 +3034,14 @@ func applyOffset(day DayTimes, offset int) DayTimes {
 		Maghrib:   adjust(day.Maghrib),
 		Isha:      adjust(day.Isha),
 	}
+}
+
+func defaultStatePath() string {
+	configDir, err := os.UserConfigDir()
+	if err == nil && strings.TrimSpace(configDir) != "" {
+		return filepath.Join(configDir, "ramadan-bot", "state.json")
+	}
+	return "state.json"
 }
 
 func resolveRamadanStart(loc *time.Location) time.Time {

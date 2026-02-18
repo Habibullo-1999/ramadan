@@ -10,8 +10,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ramadan
 FROM alpine:3.20
 
 RUN apk add --no-cache ca-certificates tzdata ttf-dejavu
+RUN mkdir -p /data
 
 ENV TZ=Asia/Dushanbe
+ENV STATE_FILE=/data/state.json
 
 COPY --from=builder /out/ramadan-bot /usr/local/bin/ramadan-bot
 
