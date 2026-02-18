@@ -119,6 +119,23 @@ func TestBuildCalendarsRegionOffset(t *testing.T) {
 	}
 }
 
+func TestCurrentDayScheduleBeforeStartReturnsDayZero(t *testing.T) {
+	loc := time.FixedZone("UTC+5", 5*3600)
+	days := []DayTimes{
+		{Day: 0, Data: "pre-start"},
+		{Day: 1, Data: "day1"},
+	}
+
+	start := time.Now().In(loc).Add(12 * time.Hour)
+	got := currentDaySchedule(days, start, loc)
+	if got == nil {
+		t.Fatal("expected day schedule, got nil")
+	}
+	if got.Day != 0 {
+		t.Fatalf("expected day 0 before start, got day %d (%s)", got.Day, got.Data)
+	}
+}
+
 func TestSendReminderUsesLocalizedNiyatAndTime(t *testing.T) {
 	loc := time.FixedZone("UTC+5", 5*3600)
 	var sent string

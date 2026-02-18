@@ -2533,7 +2533,7 @@ func mustClockToMinutes(raw string) int {
 func currentDaySchedule(days []DayTimes, start time.Time, loc *time.Location) *DayTimes {
 	now := time.Now().In(loc)
 
-	dayIndex := int(now.Sub(start).Hours()/24) + 1
+	dayIndex := int(math.Floor(now.Sub(start).Hours()/24.0)) + 1
 	if dayIndex < 0 || dayIndex > len(days) {
 		return nil
 	}
