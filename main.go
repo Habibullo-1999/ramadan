@@ -54,6 +54,9 @@ type Bot struct {
 	ramadanStart  time.Time
 	defaultRegion string
 	imageCache    *imageCache
+	hadithAPIURL  string
+	hadithCatsMu  sync.RWMutex
+	hadithCats    map[string]cachedHadithCategories
 }
 
 type Update struct {
@@ -115,6 +118,35 @@ type sendMessageRequest struct {
 	ReplyMarkup           interface{} `json:"reply_markup,omitempty"`
 	ParseMode             string      `json:"parse_mode,omitempty"`
 	DisableWebPagePreview bool        `json:"disable_web_page_preview"`
+}
+
+type hadithAPICategory struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+type hadithAPIListResp struct {
+	Data []hadithAPIListItem `json:"data"`
+	Meta struct {
+		CurrentPage string `json:"current_page"`
+		LastPage    int    `json:"last_page"`
+		TotalItems  int    `json:"total_items"`
+		PerPage     string `json:"per_page"`
+	} `json:"meta"`
+}
+
+type hadithAPIListItem struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+type hadithAPIDetail struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Hadeeth     string `json:"hadeeth"`
+	Attribution string `json:"attribution"`
+	Grade       string `json:"grade"`
+	Reference   string `json:"reference"`
 }
 
 // DayTimes keeps prayer times in minutes from midnight for a single Ramadan day.
@@ -181,6 +213,11 @@ type cachedImage struct {
 	expiresAt time.Time
 }
 
+type cachedHadithCategories struct {
+	items     []hadithAPICategory
+	expiresAt time.Time
+}
+
 type reminderState struct {
 	cancel context.CancelFunc
 	region string
@@ -207,8 +244,8 @@ var translations = map[string]map[string]string{
 		"choose_language":         "Лутфан забони худро интихоб кунед:\n\nТоҷикӣ / Русский / English / O'zbek",
 		"language_saved":          "Забон интихоб шуд.",
 		"choose_region":           "Минтақаи худро интихоб кунед:",
-		"welcome":                 "Ассалому алайкум! Ман барои тақвими Рамазон, ёдовариҳо ва ниятҳо кӯмак мекунам.\n\nФармонҳо:\n/lang — ивази забон\n/region — интихоби минтақа\n/calendar — тақвими Рамазон (саҳар ва ифтор)\n/today — вақтҳои имрӯз (саҳар ва ифтор)\n/notifyoff — хомӯш кардани ёдовариҳо\n/notifyon — фаъол кардани ёдовариҳо\n/testnotify — ирсоли ёдоварии санҷишӣ\n/menu ё /help — меню ва клавиатура",
-		"help":                    "Фармонҳо:\n/lang — ивази забон\n/region — интихоби минтақа\n/calendar — тақвими Рамазон (саҳар ва ифтор)\n/today — вақтҳои имрӯз (саҳар ва ифтор)\n/notifyoff — хомӯш кардани ёдовариҳо\n/notifyon — фаъол кардани ёдовариҳо\n/testnotify — ирсоли ёдоварии санҷишӣ\n/menu ё /help — меню ва клавиатура",
+		"welcome":                 "Ассалому алайкум! Ман барои тақвими Рамазон, ёдовариҳо ва ниятҳо кӯмак мекунам.\n\nФармонҳо:\n/lang — ивази забон\n/region — интихоби минтақа\n/calendar — тақвими Рамазон (саҳар ва ифтор)\n/today — вақтҳои имрӯз (саҳар ва ифтор)\n/hadiths — ҳадиси тасодуфӣ аз API\n/notifyoff — хомӯш кардани ёдовариҳо\n/notifyon — фаъол кардани ёдовариҳо\n/testnotify — ирсоли ёдоварии санҷишӣ\n/menu ё /help — меню ва клавиатура",
+		"help":                    "Фармонҳо:\n/lang — ивази забон\n/region — интихоби минтақа\n/calendar — тақвими Рамазон (саҳар ва ифтор)\n/today — вақтҳои имрӯз (саҳар ва ифтор)\n/hadiths — ҳадиси тасодуфӣ аз API\n/notifyoff — хомӯш кардани ёдовариҳо\n/notifyon — фаъол кардани ёдовариҳо\n/testnotify — ирсоли ёдоварии санҷишӣ\n/menu ё /help — меню ва клавиатура",
 		"region_selected":         "Минтақа интихоб шуд: %s\nЁдовариҳо ба таври худкор фаъол шуданд (30 дақиқа пеш аз ҳар намоз, саҳар ва ифтор).",
 		"need_region_first":       "Лутфан аввал минтақаро бо /region интихоб кунед.",
 		"calendar_not_found":      "Тақвим барои минтақаи интихобшуда ёфт нашуд. Минтақаро бо /region аз нав интихоб кунед.",
@@ -255,6 +292,7 @@ var translations = map[string]map[string]string{
 		"event_asr":               "Аср",
 		"event_maghrib":           "Шом (ифтор)",
 		"event_isha":              "Хуфтан",
+		"btn_hadiths":             "☪️ Ҳадиси тасодуфӣ",
 		"btn_calendar":            "🗓 Тақвим",
 		"btn_today":               "🌙 Имрӯз",
 		"btn_region":              "📍 Минтақа",
@@ -268,8 +306,8 @@ var translations = map[string]map[string]string{
 		"choose_language":         "Выберите язык:\n\nТоҷикӣ / Русский / English / O'zbek",
 		"language_saved":          "Язык выбран.",
 		"choose_region":           "Выберите свой регион:",
-		"welcome":                 "Ассалому алейкум! Я помогу с календарём Рамадана, напоминаниями и ниётами.\n\nКоманды:\n/lang — сменить язык\n/region — выбрать регион\n/calendar — календарь Рамадана (сухур и ифтар)\n/today — времена на сегодня (сухур и ифтар)\n/notifyoff — выключить напоминания\n/notifyon — включить напоминания\n/testnotify — отправить тест уведомления\n/menu или /help — меню и клавиатура",
-		"help":                    "Команды:\n/lang — сменить язык\n/region — выбор региона\n/calendar — календарь Рамадана (сухур и ифтар)\n/today — времена на сегодня (сухур и ифтар)\n/notifyoff — выключить напоминания\n/notifyon — включить напоминания\n/testnotify — отправить тест уведомления\n/menu или /help — меню и клавиатура",
+		"welcome":                 "Ассалому алейкум! Я помогу с календарём Рамадана, напоминаниями и ниётами.\n\nКоманды:\n/lang — сменить язык\n/region — выбрать регион\n/calendar — календарь Рамадана (сухур и ифтар)\n/today — времена на сегодня (сухур и ифтар)\n/hadiths — случайный хадис из API\n/notifyoff — выключить напоминания\n/notifyon — включить напоминания\n/testnotify — отправить тест уведомления\n/menu или /help — меню и клавиатура",
+		"help":                    "Команды:\n/lang — сменить язык\n/region — выбор региона\n/calendar — календарь Рамадана (сухур и ифтар)\n/today — времена на сегодня (сухур и ифтар)\n/hadiths — случайный хадис из API\n/notifyoff — выключить напоминания\n/notifyon — включить напоминания\n/testnotify — отправить тест уведомления\n/menu или /help — меню и клавиатура",
 		"region_selected":         "Регион выбран: %s\nНапоминания включены автоматически (за 30 минут до каждого намаза, сухура и ифтара).",
 		"need_region_first":       "Сначала выберите регион через /region.",
 		"calendar_not_found":      "Календарь для выбранного региона не найден. Переустановите регион командой /region.",
@@ -316,6 +354,7 @@ var translations = map[string]map[string]string{
 		"event_asr":               "Аср",
 		"event_maghrib":           "Магриб (ифтар)",
 		"event_isha":              "Иша",
+		"btn_hadiths":             "☪️ Cлучайный хадис",
 		"btn_calendar":            "🗓 Календарь",
 		"btn_today":               "🌙 Сегодня",
 		"btn_region":              "📍 Регион",
@@ -329,8 +368,8 @@ var translations = map[string]map[string]string{
 		"choose_language":         "Choose language:\n\nТоҷикӣ / Русский / English / O'zbek",
 		"language_saved":          "Language selected.",
 		"choose_region":           "Select your region:",
-		"welcome":                 "Assalamu alaikum! I can help with Ramadan calendar, reminders, and niyat texts.\n\nCommands:\n/lang — change language\n/region — select region\n/calendar — Ramadan calendar (suhoor and iftar)\n/today — today timings (suhoor and iftar)\n/notifyoff — disable reminders\n/notifyon — enable reminders\n/testnotify — send test reminder\n/menu or /help — menu and keyboard",
-		"help":                    "Commands:\n/lang — change language\n/region — select region\n/calendar — Ramadan calendar (suhoor and iftar)\n/today — today timings (suhoor and iftar)\n/notifyoff — disable reminders\n/notifyon — enable reminders\n/testnotify — send test reminder\n/menu or /help — menu and keyboard",
+		"welcome":                 "Assalamu alaikum! I can help with Ramadan calendar, reminders, and niyat texts.\n\nCommands:\n/lang — change language\n/region — select region\n/calendar — Ramadan calendar (suhoor and iftar)\n/today — today timings (suhoor and iftar)\n/hadiths — random hadith from API\n/notifyoff — disable reminders\n/notifyon — enable reminders\n/testnotify — send test reminder\n/menu or /help — menu and keyboard",
+		"help":                    "Commands:\n/lang — change language\n/region — select region\n/calendar — Ramadan calendar (suhoor and iftar)\n/today — today timings (suhoor and iftar)\n/hadiths — random hadith from API\n/notifyoff — disable reminders\n/notifyon — enable reminders\n/testnotify — send test reminder\n/menu or /help — menu and keyboard",
 		"region_selected":         "Region selected: %s\nReminders enabled automatically (30 minutes before each prayer, suhoor and iftar).",
 		"need_region_first":       "Please select a region first with /region.",
 		"calendar_not_found":      "Calendar for selected region not found. Re-select region with /region.",
@@ -377,6 +416,7 @@ var translations = map[string]map[string]string{
 		"event_asr":               "Asr",
 		"event_maghrib":           "Maghrib (iftar)",
 		"event_isha":              "Isha",
+		"btn_hadiths":             "☪️ Random hadith",
 		"btn_calendar":            "🗓 Calendar",
 		"btn_today":               "🌙 Today",
 		"btn_region":              "📍 Region",
@@ -390,8 +430,8 @@ var translations = map[string]map[string]string{
 		"choose_language":         "Tilni tanlang:\n\nТоҷикӣ / Русский / English / O'zbek",
 		"language_saved":          "Til tanlandi.",
 		"choose_region":           "Mintaqangizni tanlang:",
-		"welcome":                 "Assalomu alaykum! Men Ramazon taqvimi, eslatmalar va niyatlarda yordam beraman.\n\nBuyruqlar:\n/lang — tilni almashtirish\n/region — mintaqani tanlash\n/calendar — Ramazon taqvimi (saharlik va iftor)\n/today — bugungi vaqtlar (saharlik va iftor)\n/notifyoff — eslatmalarni o‘chirish\n/notifyon — eslatmalarni yoqish\n/testnotify — test eslatma yuborish\n/menu yoki /help — menyu va klaviatura",
-		"help":                    "Buyruqlar:\n/lang — tilni almashtirish\n/region — mintaqani tanlash\n/calendar — Ramazon taqvimi (saharlik va iftor)\n/today — bugungi vaqtlar (saharlik va iftor)\n/notifyoff — eslatmalarni o‘chirish\n/notifyon — eslatmalarni yoqish\n/testnotify — test eslatma yuborish\n/menu yoki /help — menyu va klaviatura",
+		"welcome":                 "Assalomu alaykum! Men Ramazon taqvimi, eslatmalar va niyatlarda yordam beraman.\n\nBuyruqlar:\n/lang — tilni almashtirish\n/region — mintaqani tanlash\n/calendar — Ramazon taqvimi (saharlik va iftor)\n/today — bugungi vaqtlar (saharlik va iftor)\n/hadiths — API dan tasodifiy hadis\n/notifyoff — eslatmalarni o‘chirish\n/notifyon — eslatmalarni yoqish\n/testnotify — test eslatma yuborish\n/menu yoki /help — menyu va klaviatura",
+		"help":                    "Buyruqlar:\n/lang — tilni almashtirish\n/region — mintaqani tanlash\n/calendar — Ramazon taqvimi (saharlik va iftor)\n/today — bugungi vaqtlar (saharlik va iftor)\n/hadiths — API dan tasodifiy hadis\n/notifyoff — eslatmalarni o‘chirish\n/notifyon — eslatmalarni yoqish\n/testnotify — test eslatma yuborish\n/menu yoki /help — menyu va klaviatura",
 		"region_selected":         "Mintaqa tanlandi: %s\nEslatmalar avtomatik yoqildi (har namoz, saharlik va iftordan 30 daqiqa oldin).",
 		"need_region_first":       "Avval /region orqali mintaqani tanlang.",
 		"calendar_not_found":      "Tanlangan mintaqa uchun taqvim topilmadi. /region bilan qayta tanlang.",
@@ -438,6 +478,7 @@ var translations = map[string]map[string]string{
 		"event_asr":               "Asr",
 		"event_maghrib":           "Shom (iftor)",
 		"event_isha":              "Xufton",
+		"btn_hadiths":             "☪️ Tasodifiy hadis",
 		"btn_calendar":            "🗓 Taqvim",
 		"btn_today":               "🌙 Bugun",
 		"btn_region":              "📍 Mintaqa",
@@ -560,6 +601,8 @@ func newBot(token string, state *StateStore, calendars map[string][]DayTimes, tz
 		ramadanStart:  start,
 		defaultRegion: "Душанбе",
 		imageCache:    cache,
+		hadithAPIURL:  "https://hadeethenc.com/api/v1",
+		hadithCats:    make(map[string]cachedHadithCategories),
 	}
 
 	manager := &ReminderManager{
@@ -595,6 +638,7 @@ func (b *Bot) setCommands() error {
 		{Command: "region", Description: "Region / Регион / Минтақа"},
 		{Command: "calendar", Description: "Ramadan calendar"},
 		{Command: "today", Description: "Today timings"},
+		{Command: "hadiths", Description: "Random hadith"},
 		{Command: "notifyon", Description: "Enable reminders"},
 		{Command: "notifyoff", Description: "Disable reminders"},
 		{Command: "testnotify", Description: "Test reminder"},
@@ -832,7 +876,7 @@ func (b *Bot) resolveCommand(chatID int64, text string) string {
 		return ""
 	}
 	switch normalized {
-	case "/start", "/menu", "/help", "/lang", "/language", "/region", "/calendar", "/today", "/notifyon", "/notifyoff", "/testnotify":
+	case "/start", "/menu", "/help", "/lang", "/language", "/region", "/calendar", "/today", "/hadiths", "/notifyon", "/notifyoff", "/testnotify":
 		return normalized
 	}
 
@@ -844,6 +888,7 @@ func (b *Bot) resolveCommand(chatID int64, text string) string {
 		"btn_notify_on":  "/notifyon",
 		"btn_notify_off": "/notifyoff",
 		"btn_help":       "/help",
+		"btn_hadiths":    "/hadiths",
 	}
 	checkLangs := []string{langTG, langRU, langEN, langUZ, b.userLang(chatID)}
 	for _, l := range checkLangs {
@@ -882,6 +927,10 @@ func (b *Bot) handleMessage(msg *Message) {
 	case lower == "/today":
 		if _, ok := b.requireLanguage(msg.Chat.ID); ok {
 			b.sendToday(msg.Chat.ID)
+		}
+	case lower == "/hadiths":
+		if _, ok := b.requireLanguage(msg.Chat.ID); ok {
+			b.sendHadith(msg.Chat.ID)
 		}
 	case lower == "/notifyoff":
 		if _, ok := b.requireLanguage(msg.Chat.ID); ok {
@@ -1072,6 +1121,206 @@ func (b *Bot) sendToday(chatID int64) {
 	}
 }
 
+func (b *Bot) sendHadith(chatID int64) {
+	lang := b.userLang(chatID)
+	text, err := b.randomHadithFromAPI(lang)
+	if err != nil {
+		log.Printf("hadith api error for chat %d: %v", chatID, err)
+		text = formatHadithBlock(lang, tr(lang, "hadith_day_title"), b.randomHadith(lang))
+	}
+	if err := b.SendMessage(chatID, text, nil); err != nil {
+		log.Printf("hadith send error: %v", err)
+	}
+}
+
+func (b *Bot) randomHadithFromAPI(lang string) (string, error) {
+	apiLang := hadithAPILanguageForUser(lang)
+	return b.randomHadithFromAPIByLanguage(lang, apiLang)
+}
+
+func hadithAPILanguageForUser(lang string) string {
+	normalized := normalizeLang(lang)
+	if normalized == "" {
+		return langEN
+	}
+	return normalized
+}
+
+func (b *Bot) randomHadithFromAPIByLanguage(userLang, apiLang string) (string, error) {
+	categories, err := b.fetchHadithCategories(apiLang)
+	if err != nil {
+		return "", err
+	}
+	if len(categories) == 0 {
+		return "", fmt.Errorf("no categories for api language %q", apiLang)
+	}
+
+	var lastErr error
+	maxAttempts := len(categories)
+	if maxAttempts > 3 {
+		maxAttempts = 3
+	}
+	for i, idx := range rand.Perm(len(categories)) {
+		if i >= maxAttempts {
+			break
+		}
+		categoryID := strings.TrimSpace(categories[idx].ID)
+		if categoryID == "" {
+			continue
+		}
+		items, err := b.fetchHadithList(apiLang, categoryID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(items) == 0 {
+			continue
+		}
+
+		item := items[rand.Intn(len(items))]
+		detail, err := b.fetchHadithDetail(apiLang, strings.TrimSpace(item.ID))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return formatHadithFromAPI(userLang, detail), nil
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no hadiths found for api language %q", apiLang)
+}
+
+func formatHadithFromAPI(lang string, hadith hadithAPIDetail) string {
+	text := strings.TrimSpace(hadith.Hadeeth)
+	if text == "" {
+		text = tr(lang, "hadith_fallback")
+	}
+	source := firstNonEmptyTrimmed(hadith.Attribution, hadith.Reference, hadith.Grade)
+	if source != "" {
+		text += " — " + source
+	}
+	return formatHadithBlock(lang, tr(lang, "hadith_day_title"), text)
+}
+
+func firstNonEmptyTrimmed(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (b *Bot) fetchHadithCategories(apiLang string) ([]hadithAPICategory, error) {
+	apiLang = strings.ToLower(strings.TrimSpace(apiLang))
+	if apiLang == "" {
+		return nil, fmt.Errorf("hadith API language is empty")
+	}
+	if cached, ok := b.getCachedHadithCategories(apiLang); ok {
+		return cached, nil
+	}
+
+	endpoint := b.hadithAPIEndpoint("/categories/list/", url.Values{
+		"language": {apiLang},
+	})
+	var categories []hadithAPICategory
+	if err := b.getJSON(endpoint, &categories); err != nil {
+		return nil, err
+	}
+	b.setCachedHadithCategories(apiLang, categories, 12*time.Hour)
+	return categories, nil
+}
+
+func (b *Bot) getCachedHadithCategories(apiLang string) ([]hadithAPICategory, bool) {
+	if b == nil {
+		return nil, false
+	}
+	b.hadithCatsMu.RLock()
+	cached, ok := b.hadithCats[apiLang]
+	b.hadithCatsMu.RUnlock()
+	if !ok || time.Now().After(cached.expiresAt) || len(cached.items) == 0 {
+		return nil, false
+	}
+	return append([]hadithAPICategory(nil), cached.items...), true
+}
+
+func (b *Bot) setCachedHadithCategories(apiLang string, categories []hadithAPICategory, ttl time.Duration) {
+	if b == nil || len(categories) == 0 || ttl <= 0 {
+		return
+	}
+	b.hadithCatsMu.Lock()
+	if b.hadithCats == nil {
+		b.hadithCats = make(map[string]cachedHadithCategories)
+	}
+	b.hadithCats[apiLang] = cachedHadithCategories{
+		items:     append([]hadithAPICategory(nil), categories...),
+		expiresAt: time.Now().Add(ttl),
+	}
+	b.hadithCatsMu.Unlock()
+}
+
+func (b *Bot) fetchHadithList(apiLang, categoryID string) ([]hadithAPIListItem, error) {
+	endpoint := b.hadithAPIEndpoint("/hadeeths/list/", url.Values{
+		"language":    {apiLang},
+		"category_id": {categoryID},
+		"page":        {"1"},
+		"per_page":    {"20"},
+	})
+	var resp hadithAPIListResp
+	if err := b.getJSON(endpoint, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (b *Bot) fetchHadithDetail(apiLang, hadithID string) (hadithAPIDetail, error) {
+	endpoint := b.hadithAPIEndpoint("/hadeeths/one/", url.Values{
+		"language": {apiLang},
+		"id":       {hadithID},
+	})
+	var detail hadithAPIDetail
+	if err := b.getJSON(endpoint, &detail); err != nil {
+		return hadithAPIDetail{}, err
+	}
+	return detail, nil
+}
+
+func (b *Bot) hadithAPIEndpoint(path string, query url.Values) string {
+	base := strings.TrimRight(strings.TrimSpace(b.hadithAPIURL), "/")
+	if base == "" {
+		base = "https://api.hadeethenc.com/api/v1"
+	}
+	path = "/" + strings.TrimLeft(strings.TrimSpace(path), "/")
+	if len(query) == 0 {
+		return base + path
+	}
+	return base + path + "?" + query.Encode()
+}
+
+func (b *Bot) getJSON(rawURL string, target interface{}) error {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("request %s failed with %d: %s", rawURL, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+		return fmt.Errorf("decode %s: %w", rawURL, err)
+	}
+	return nil
+}
+
 func (b *Bot) sendTestNotification(chatID int64) {
 	settings := b.state.Get(chatID)
 	lang := b.userLang(chatID)
@@ -1119,6 +1368,7 @@ func (b *Bot) menuKeyboard(lang string) ReplyKeyboardMarkup {
 	return ReplyKeyboardMarkup{
 		Keyboard: [][]KeyboardButton{
 			{
+				{Text: tr(lang, "btn_hadiths")},
 				{Text: tr(lang, "btn_calendar")},
 				{Text: tr(lang, "btn_today")},
 			},
@@ -1831,6 +2081,20 @@ func shouldTriggerReminder(now time.Time, ev eventSpec, sent map[string]bool) bo
 	return !now.Before(remindAt)
 }
 
+// markPastDayRemindersAsSent prevents "catch-up" sends after process restart.
+// If the reminder moment has already passed for today, treat it as already sent.
+func markPastDayRemindersAsSent(now time.Time, events []eventSpec, sent map[string]bool) {
+	if sent == nil {
+		return
+	}
+	for _, ev := range events {
+		remindAt := ev.Time.Add(-30 * time.Minute)
+		if now.After(remindAt) {
+			sent[ev.Key] = true
+		}
+	}
+}
+
 func (rm *ReminderManager) loop(ctx context.Context, chatID int64, region string) {
 	lang := langTG
 	if rm.getLangFn != nil {
@@ -1875,6 +2139,8 @@ func (rm *ReminderManager) loop(ctx context.Context, chatID int64, region string
 		events := reminderEventsForDay(base, *day)
 
 		sent := make(map[string]bool)
+		// On restart, skip reminders whose scheduled reminder moment already passed today.
+		markPastDayRemindersAsSent(now, events, sent)
 		nextDay := base.Add(24 * time.Hour)
 		ticker := time.NewTicker(30 * time.Second)
 
@@ -3066,47 +3332,49 @@ func buildCalendars() map[string][]DayTimes {
 	base := []struct {
 		Date    string
 		Day     int
+		Suhur   string
 		Fajr    string
 		Dhuhr   string
 		Asr     string
 		Maghrib string
 		Isha    string
 	}{
-		{"18.02.2026", 0, "05:42", "12:41", "15:40", "18:13", "19:29"},
-		{"19.02.2026", 1, "05:41", "12:41", "15:40", "18:14", "19:30"},
-		{"20.02.2026", 2, "05:40", "12:40", "15:41", "18:15", "19:31"},
-		{"21.02.2026", 3, "05:39", "12:39", "15:41", "18:16", "19:32"},
-		{"22.02.2026", 4, "05:38", "12:38", "15:42", "18:17", "19:33"},
-		{"23.02.2026", 5, "05:37", "12:38", "15:43", "18:18", "19:34"},
-		{"24.02.2026", 6, "05:35", "12:38", "15:44", "18:20", "19:35"},
-		{"25.02.2026", 7, "05:34", "12:38", "15:44", "18:21", "19:36"},
-		{"26.02.2026", 8, "05:32", "12:38", "15:45", "18:22", "19:37"},
-		{"27.02.2026", 9, "05:31", "12:38", "15:46", "18:23", "19:38"},
-		{"28.02.2026", 10, "05:29", "12:37", "15:47", "18:24", "19:39"},
-		{"01.03.2026", 11, "05:28", "12:37", "15:48", "18:26", "19:41"},
-		{"02.03.2026", 12, "05:27", "12:37", "15:48", "18:27", "19:42"},
-		{"03.03.2026", 13, "05:26", "12:37", "15:49", "18:28", "19:43"},
-		{"04.03.2026", 14, "05:24", "12:37", "15:50", "18:29", "19:44"},
-		{"05.03.2026", 15, "05:22", "12:36", "15:50", "18:30", "19:45"},
-		{"06.03.2026", 16, "05:20", "12:36", "15:51", "18:31", "19:46"},
-		{"07.03.2026", 17, "05:19", "12:36", "15:51", "18:32", "19:47"},
-		{"08.03.2026", 18, "05:17", "12:36", "15:52", "18:33", "19:48"},
-		{"09.03.2026", 19, "05:16", "12:35", "15:53", "18:34", "19:49"},
-		{"10.03.2026", 20, "05:14", "12:35", "15:53", "18:35", "19:50"},
-		{"11.03.2026", 21, "05:13", "12:35", "15:54", "18:36", "19:51"},
-		{"12.03.2026", 22, "05:11", "12:38", "15:55", "18:37", "19:52"},
-		{"13.03.2026", 23, "05:10", "12:38", "15:55", "18:38", "19:53"},
-		{"14.03.2026", 24, "05:08", "12:38", "15:56", "18:39", "19:54"},
-		{"15.03.2026", 25, "05:07", "12:38", "15:56", "18:40", "19:55"},
-		{"16.03.2026", 26, "05:05", "12:38", "15:57", "18:41", "19:56"},
-		{"17.03.2026", 27, "05:04", "12:37", "15:57", "18:42", "19:57"},
-		{"18.03.2026", 28, "05:02", "12:36", "15:57", "18:43", "19:58"},
-		{"19.03.2026", 29, "05:01", "12:35", "15:58", "18:44", "19:59"},
-		{"20.03.2026", 30, "05:00", "12:34", "15:58", "18:45", "20:00"},
+		{"18.02.2026", 0, "05:42", "06:12", "13:00", "16:40", "18:13", "19:45"},
+		{"19.02.2026", 1, "05:41", "06:11", "13:00", "16:40", "18:14", "19:46"},
+		{"20.02.2026", 2, "05:40", "06:10", "13:00", "16:41", "18:15", "19:47"},
+		{"21.02.2026", 3, "05:39", "06:09", "13:00", "16:41", "18:16", "19:48"},
+		{"22.02.2026", 4, "05:38", "06:08", "13:00", "16:42", "18:17", "19:49"},
+		{"23.02.2026", 5, "05:37", "06:07", "13:00", "16:43", "18:18", "19:50"},
+		{"24.02.2026", 6, "05:35", "06:05", "13:00", "16:44", "18:20", "19:52"},
+		{"25.02.2026", 7, "05:34", "06:04", "13:00", "16:44", "18:21", "19:52"},
+		{"26.02.2026", 8, "05:32", "06:02", "13:00", "16:45", "18:22", "19:53"},
+		{"27.02.2026", 9, "05:31", "06:01", "13:00", "16:46", "18:23", "19:54"},
+		{"28.02.2026", 10, "05:29", "05:59", "13:00", "16:47", "18:24", "19:55"},
+		{"01.03.2026", 11, "05:28", "05:58", "13:00", "16:48", "18:26", "19:56"},
+		{"02.03.2026", 12, "05:27", "05:57", "13:00", "16:48", "18:27", "19:57"},
+		{"03.03.2026", 13, "05:26", "05:56", "13:00", "16:49", "18:28", "19:58"},
+		{"04.03.2026", 14, "05:24", "05:54", "13:00", "16:50", "18:29", "19:59"},
+		{"05.03.2026", 15, "05:22", "05:52", "13:00", "16:50", "18:30", "20:00"},
+		{"06.03.2026", 16, "05:20", "05:50", "13:00", "16:51", "18:31", "20:01"},
+		{"07.03.2026", 17, "05:19", "05:49", "13:00", "16:51", "18:32", "20:02"},
+		{"08.03.2026", 18, "05:17", "05:47", "13:00", "16:52", "18:33", "20:03"},
+		{"09.03.2026", 19, "05:16", "05:46", "13:00", "16:53", "18:34", "20:04"},
+		{"10.03.2026", 20, "05:14", "05:44", "13:00", "16:53", "18:35", "20:05"},
+		{"11.03.2026", 21, "05:13", "05:43", "13:00", "16:54", "18:36", "20:06"},
+		{"12.03.2026", 22, "05:11", "05:41", "13:00", "16:55", "18:37", "20:07"},
+		{"13.03.2026", 23, "05:10", "05:40", "13:00", "16:55", "18:38", "20:08"},
+		{"14.03.2026", 24, "05:08", "05:38", "13:00", "16:56", "18:39", "20:09"},
+		{"15.03.2026", 25, "05:07", "05:37", "13:00", "16:56", "18:40", "20:10"},
+		{"16.03.2026", 26, "05:05", "05:35", "13:00", "16:57", "18:41", "20:12"},
+		{"17.03.2026", 27, "05:04", "05:34", "13:00", "16:57", "18:42", "20:13"},
+		{"18.03.2026", 28, "05:02", "05:32", "13:00", "16:57", "18:43", "20:14"},
+		{"19.03.2026", 29, "05:01", "05:31", "13:00", "16:58", "18:44", "20:15"},
+		{"20.03.2026", 30, "05:00", "05:30", "13:00", "16:58", "18:45", "20:16"},
 	}
 
 	var baseDays []DayTimes
 	for _, d := range base {
+		suhur := mustClockToMinutes(d.Suhur)
 		fajr := mustClockToMinutes(d.Fajr)
 		dhuhr := mustClockToMinutes(d.Dhuhr)
 		asr := mustClockToMinutes(d.Asr)
@@ -3115,7 +3383,7 @@ func buildCalendars() map[string][]DayTimes {
 		baseDays = append(baseDays, DayTimes{
 			Data:      d.Date,
 			Day:       d.Day,
-			SuhoorEnd: fajr,
+			SuhoorEnd: suhur,
 			Fajr:      fajr,
 			Dhuhr:     dhuhr,
 			Asr:       asr,

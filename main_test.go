@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -103,6 +105,33 @@ func TestShouldTriggerReminder(t *testing.T) {
 	}
 }
 
+func TestMarkPastDayRemindersAsSent(t *testing.T) {
+	loc := time.FixedZone("UTC+5", 5*3600)
+	base := time.Date(2026, time.February, 19, 0, 0, 0, 0, loc)
+	day := DayTimes{
+		Day:       1,
+		SuhoorEnd: 341,  // 05:41
+		Fajr:      341,  // 05:41
+		Dhuhr:     761,  // 12:41
+		Asr:       940,  // 15:40
+		Maghrib:   1094, // 18:14
+		Isha:      1170, // 19:30
+	}
+	events := reminderEventsForDay(base, day)
+
+	// Bot restarts at 16:00 local time. Reminders due before 16:00 must be skipped.
+	now := time.Date(2026, time.February, 19, 16, 0, 0, 0, loc)
+	sent := make(map[string]bool)
+	markPastDayRemindersAsSent(now, events, sent)
+
+	if !sent["suhoor"] || !sent["fajr"] || !sent["dhuhr"] || !sent["asr"] {
+		t.Fatalf("expected past reminders to be marked sent, got: %+v", sent)
+	}
+	if sent["maghrib"] || sent["isha"] {
+		t.Fatalf("expected future reminders to stay pending, got: %+v", sent)
+	}
+}
+
 func TestBuildCalendarsRegionOffset(t *testing.T) {
 	cal := buildCalendars()
 	dushanbe := cal["Душанбе"]
@@ -167,5 +196,95 @@ func TestSendReminderUsesLocalizedNiyatAndTime(t *testing.T) {
 	}
 	if !strings.Contains(sent, "EN_SUHOOR") {
 		t.Fatalf("expected localized suhoor niyat text, got: %q", sent)
+	}
+}
+
+func TestResolveCommandHadiths(t *testing.T) {
+	b := &Bot{}
+	got := b.resolveCommand(42, "/hadiths")
+	if got != "/hadiths" {
+		t.Fatalf("expected /hadiths command, got %q", got)
+	}
+}
+
+func TestRandomHadithFromAPIUsesUserLanguageOnly(t *testing.T) {
+	var requestedLangs []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lang := r.URL.Query().Get("language")
+		requestedLangs = append(requestedLangs, lang)
+
+		if lang != langRU {
+			http.Error(w, "unsupported language", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/categories/list/":
+			_, _ = w.Write([]byte(`[{"id":"1","title":"Faith"}]`))
+		case "/api/v1/hadeeths/list/":
+			_, _ = w.Write([]byte(`{"data":[{"id":"42","title":"Patience"}],"meta":{"current_page":"1","last_page":1,"total_items":1,"per_page":"20"}}`))
+		case "/api/v1/hadeeths/one/":
+			_, _ = w.Write([]byte(`{"id":"42","title":"Patience","hadeeth":"Be patient","attribution":"Bukhari"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	b := &Bot{
+		client:       srv.Client(),
+		hadithAPIURL: srv.URL + "/api/v1",
+	}
+
+	got, err := b.randomHadithFromAPI(langRU)
+	if err != nil {
+		t.Fatalf("randomHadithFromAPI returned error: %v", err)
+	}
+	if !strings.Contains(got, "Be patient") {
+		t.Fatalf("expected hadith text in response, got: %q", got)
+	}
+
+	if len(requestedLangs) == 0 {
+		t.Fatal("expected hadith API calls, got none")
+	}
+	for _, lang := range requestedLangs {
+		if lang != langRU {
+			t.Fatalf("expected only user language %q, got request language %q", langRU, lang)
+		}
+	}
+}
+
+func TestFetchHadithCategoriesUsesCache(t *testing.T) {
+	categoryCalls := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/categories/list/" {
+			categoryCalls++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":"1","title":"Faith"}]`))
+	}))
+	defer srv.Close()
+
+	b := &Bot{
+		client:       srv.Client(),
+		hadithAPIURL: srv.URL + "/api/v1",
+	}
+
+	first, err := b.fetchHadithCategories(langEN)
+	if err != nil {
+		t.Fatalf("first fetchHadithCategories returned error: %v", err)
+	}
+	second, err := b.fetchHadithCategories(langEN)
+	if err != nil {
+		t.Fatalf("second fetchHadithCategories returned error: %v", err)
+	}
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("unexpected categories lengths: first=%d second=%d", len(first), len(second))
+	}
+	if categoryCalls != 1 {
+		t.Fatalf("expected one API call due to cache, got %d", categoryCalls)
 	}
 }
